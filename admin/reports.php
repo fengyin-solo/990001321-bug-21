@@ -3,6 +3,10 @@ require_once __DIR__ . '/../includes/functions.php';
 require_once __DIR__ . '/../config/database.php';
 requireAdmin();
 
+// 后台页面不缓存，处理后刷新始终取服务端最新状态
+header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
+header('Pragma: no-cache');
+
 $pageTitle = '举报管理 - 社区便民留言板';
 $currentPage = 'admin';
 $cssPath = '../assets/css/style.css';
@@ -36,26 +40,36 @@ if ($keyword) {
     $params[] = $kw;
 }
 
-$countStmt = $db->prepare("SELECT COUNT(*) FROM reports r LEFT JOIN messages m ON r.message_id = m.id $where");
-$countStmt->execute($params);
-$total = $countStmt->fetchColumn();
+// 列表、总数与各项统计使用同一数据库快照，避免并发处理时数量对不上
+$db->beginTransaction();
+try {
+    $countStmt = $db->prepare("SELECT COUNT(*) FROM reports r LEFT JOIN messages m ON r.message_id = m.id $where");
+    $countStmt->execute($params);
+    $total = $countStmt->fetchColumn();
+
+    $sql = "SELECT r.*, m.title as message_title, m.nickname as message_nickname, m.type as message_type, a.username as admin_name
+            FROM reports r
+            LEFT JOIN messages m ON r.message_id = m.id
+            LEFT JOIN admins a ON r.processed_by = a.id
+            $where
+            ORDER BY r.created_at DESC
+            LIMIT $pageSize OFFSET $offset";
+    $stmt = $db->prepare($sql);
+    $stmt->execute($params);
+    $reports = $stmt->fetchAll();
+
+    $pendingCount = $db->query("SELECT COUNT(*) FROM reports WHERE status = 0")->fetchColumn();
+    // 侧边栏“待审核留言”使用留言的待审数量，不能与举报待处理数混用
+    $pendingMessageCount = $db->query("SELECT COUNT(*) FROM messages WHERE status = 0")->fetchColumn();
+    $totalReportCount = $db->query("SELECT COUNT(*) FROM reports")->fetchColumn();
+    $deletedCount = $db->query("SELECT COUNT(*) FROM reports WHERE status = 1")->fetchColumn();
+    $ignoredCount = $db->query("SELECT COUNT(*) FROM reports WHERE status = 2")->fetchColumn();
+    $db->commit();
+} catch (Exception $e) {
+    if ($db->inTransaction()) $db->rollBack();
+    throw $e;
+}
 $totalPages = ceil($total / $pageSize);
-
-$sql = "SELECT r.*, m.title as message_title, m.nickname as message_nickname, m.type as message_type, a.username as admin_name 
-        FROM reports r 
-        LEFT JOIN messages m ON r.message_id = m.id 
-        LEFT JOIN admins a ON r.processed_by = a.id 
-        $where 
-        ORDER BY r.created_at DESC 
-        LIMIT $pageSize OFFSET $offset";
-$stmt = $db->prepare($sql);
-$stmt->execute($params);
-$reports = $stmt->fetchAll();
-
-$pendingCount = getPendingReportCount();
-$totalReportCount = $db->query("SELECT COUNT(*) FROM reports")->fetchColumn();
-$deletedCount = $db->query("SELECT COUNT(*) FROM reports WHERE status = 1")->fetchColumn();
-$ignoredCount = $db->query("SELECT COUNT(*) FROM reports WHERE status = 2")->fetchColumn();
 
 include __DIR__ . '/header.php';
 ?>
@@ -67,7 +81,7 @@ include __DIR__ . '/header.php';
         </div>
         <nav class="sidebar-nav">
             <a href="index.php" class="sidebar-link">📝 留言管理</a>
-            <a href="index.php?status=0" class="sidebar-link">⏳ 待审核 <?= $pendingCount > 0 ? "($pendingCount)" : '' ?></a>
+            <a href="index.php?status=0" class="sidebar-link">⏳ 待审核 <?= $pendingMessageCount > 0 ? "($pendingMessageCount)" : '' ?></a>
             <a href="reports.php" class="sidebar-link active">🚩 举报管理</a>
             <a href="reports.php?status=0" class="sidebar-link">⏳ 待处理 <?= $pendingCount > 0 ? "($pendingCount)" : '' ?></a>
             <a href="../index.php" class="sidebar-link" target="_blank">🌐 查看前台</a>
@@ -220,51 +234,60 @@ include __DIR__ . '/header.php';
 <script>
 let pendingProcessId = null;
 let pendingProcessStatus = null;
+let processing = false;
 
 function viewReport(id) {
     document.getElementById('reportViewModal').style.display = 'flex';
-    document.getElementById('reportViewBody').innerHTML = '加载中...';
-    fetch('api.php?action=report_detail&id=' + id)
-    .then(r => r.json())
+    const body = document.getElementById('reportViewBody');
+    body.innerHTML = '加载中...';
+    fetch('api.php?action=report_detail&id=' + id, {cache: 'no-store'})
+    .then(r => {
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return r.json();
+    })
     .then(data => {
-        if (data.code === 0) {
-            const d = data.data;
-            let html = '<div class="detail-view">';
-            html += '<p><strong>举报ID：</strong>' + d.id + '</p>';
-            html += '<p><strong>举报类型：</strong><span class="badge badge-' + d.report_type + '">' + d.report_type_label + '</span></p>';
-            html += '<p><strong>举报时间：</strong>' + d.created_at + '</p>';
-            html += '<p><strong>举报状态：</strong><span class="status-badge report-status-' + d.status_class + '">' + d.status_label + '</span></p>';
-            if (d.description) {
-                html += '<p><strong>举报说明：</strong></p><div class="detail-text">' + d.description + '</div>';
-            }
-            html += '<hr style="margin: 16px 0; border: none; border-top: 1px solid #e5e7eb;">';
-            html += '<h4 style="margin-bottom: 12px;">被举报留言信息</h4>';
-            if (d.message_exists) {
-                html += '<p><strong>留言标题：</strong>' + d.message_title + '</p>';
-                html += '<p><strong>留言作者：</strong>' + d.message_nickname + '</p>';
-                html += '<p><strong>留言类型：</strong>' + d.message_type_label + '</p>';
-                html += '<p><strong>留言内容：</strong></p><div class="detail-text">' + d.message_content + '</div>';
-                if (d.message_image) {
-                    html += '<p><strong>留言图片：</strong><br><img src="../' + d.message_image + '" style="max-width:100%;margin-top:8px;"></p>';
-                }
-                html += '<p><a href="../detail.php?id=' + d.message_id + '" target="_blank" class="btn btn-sm btn-info">查看原留言</a></p>';
-            } else {
-                html += '<p class="text-muted">该留言已被删除</p>';
-            }
-            if (d.status > 0) {
-                html += '<hr style="margin: 16px 0; border: none; border-top: 1px solid #e5e7eb;">';
-                html += '<h4 style="margin-bottom: 12px;">处理信息</h4>';
-                html += '<p><strong>处理人：</strong>' + (d.admin_name || '-') + '</p>';
-                html += '<p><strong>处理时间：</strong>' + (d.processed_at || '-') + '</p>';
-                if (d.process_note) {
-                    html += '<p><strong>处理备注：</strong></p><div class="detail-text">' + d.process_note + '</div>';
-                }
-            }
-            html += '</div>';
-            document.getElementById('reportViewBody').innerHTML = html;
-        } else {
-            document.getElementById('reportViewBody').innerHTML = data.msg;
+        if (data.code !== 0) throw new Error(data.msg || '详情加载失败');
+        const d = data.data;
+        let html = '<div class="detail-view">';
+        html += '<p><strong>举报ID：</strong>' + d.id + '</p>';
+        html += '<p><strong>举报类型：</strong><span class="badge badge-' + d.report_type + '">' + d.report_type_label + '</span></p>';
+        html += '<p><strong>举报时间：</strong>' + d.created_at + '</p>';
+        html += '<p><strong>举报状态：</strong><span class="status-badge report-status-' + d.status_class + '">' + d.status_label + '</span></p>';
+        if (d.description) {
+            html += '<p><strong>举报说明：</strong></p><div class="detail-text">' + d.description + '</div>';
         }
+        html += '<hr style="margin: 16px 0; border: none; border-top: 1px solid #e5e7eb;">';
+        html += '<h4 style="margin-bottom: 12px;">被举报留言信息</h4>';
+        if (d.message_exists) {
+            html += '<p><strong>留言标题：</strong>' + d.message_title + '</p>';
+            html += '<p><strong>留言作者：</strong>' + d.message_nickname + '</p>';
+            html += '<p><strong>留言类型：</strong>' + d.message_type_label + '</p>';
+            html += '<p><strong>留言内容：</strong></p><div class="detail-text">' + d.message_content + '</div>';
+            if (d.message_image) {
+                html += '<p><strong>留言图片：</strong><br><img src="../' + d.message_image + '" style="max-width:100%;margin-top:8px;"></p>';
+            }
+            html += '<p><a href="../detail.php?id=' + d.message_id + '" target="_blank" class="btn btn-sm btn-info">查看原留言</a></p>';
+        } else {
+            html += '<p class="text-muted">该留言已被删除</p>';
+        }
+        if (d.status > 0) {
+            html += '<hr style="margin: 16px 0; border: none; border-top: 1px solid #e5e7eb;">';
+            html += '<h4 style="margin-bottom: 12px;">处理信息</h4>';
+            html += '<p><strong>处理人：</strong>' + (d.admin_name || '-') + '</p>';
+            html += '<p><strong>处理时间：</strong>' + (d.processed_at || '-') + '</p>';
+            if (d.process_note) {
+                html += '<p><strong>处理备注：</strong></p><div class="detail-text">' + d.process_note + '</div>';
+            }
+        }
+        html += '</div>';
+        body.innerHTML = html;
+    })
+    .catch(error => {
+        // 失败不残留旧内容，给出原因和重试入口
+        body.innerHTML = '<div class="text-center" style="padding:20px;">'
+            + '详情加载失败：' + (error && error.message ? error.message : '网络错误')
+            + '<br><br><button type="button" class="btn btn-primary btn-sm" onclick="viewReport(' + id + ')">重试</button>'
+            + '</div>';
     });
 }
 
@@ -301,8 +324,15 @@ function closeProcessNoteModal() {
 
 function confirmProcess() {
     if (!pendingProcessId || !pendingProcessStatus) return;
+    if (processing) return; // 防重复点击
 
     const note = document.getElementById('processNote').value;
+    const btn = document.querySelector('#processNoteModal .btn-primary');
+    const originalText = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = '处理中...';
+    processing = true;
+
     const formData = new FormData();
     formData.append('action', 'process_report');
     formData.append('id', pendingProcessId);
@@ -311,17 +341,41 @@ function confirmProcess() {
 
     fetch('api.php', {
         method: 'POST',
-        body: formData
+        body: formData,
+        redirect: 'error',
+        cache: 'no-store'
     })
-    .then(r => r.json())
-    .then(data => {
+    .then(resp => {
+        if (!resp.ok) throw new Error('服务器返回异常（HTTP ' + resp.status + '），请检查网络或重新登录后重试');
+        return resp.text();
+    })
+    .then(text => {
+        let data;
+        try {
+            data = JSON.parse(text);
+        } catch (e) {
+            throw new Error('服务端响应异常，操作未生效，请重新登录后重试');
+        }
         if (data.code === 0) {
-            alert('操作成功');
+            // 仅在服务端确认成功后关闭弹窗并刷新
+            processing = false;
             closeProcessNoteModal();
+            alert(data.msg || '操作成功');
             location.reload();
         } else {
-            alert(data.msg);
+            // 失败：保留弹窗与备注，恢复按钮，允许重试
+            alert((data.msg || '操作失败') + '\n状态未改变，可修改后重试');
+            btn.disabled = false;
+            btn.textContent = originalText;
+            processing = false;
         }
+    })
+    .catch(error => {
+        // 网络失败 / 非 JSON 响应：明确说明原因，不关闭弹窗，可直接重试
+        alert((error.message || '网络请求失败，请检查网络后重试') + '\n状态未改变，可重试');
+        btn.disabled = false;
+        btn.textContent = originalText;
+        processing = false;
     });
 }
 
